@@ -3,9 +3,11 @@
 # 只列「本包直接 import 的第三方库」。
 # ComfyUI 本身（comfy.* / folder_paths / node_helpers）由宿主提供，不在此列。
 #
-# 注意：本包在 **import 期**只依赖标准库；
-# torch / safetensors 都是**函数内延迟 import**（见 relay_core.save_av_latent /
-# load_av_latent），因此缺少它们时节点仍能注册，只是真正用到时才会报错。
+# 依赖说明：
+#   · torch 是**模块顶层 import**（relay_core.py）——缺少它 = 整包注册失败，
+#     ComfyUI 里看不到任何 H3 Relay 节点（宿主 ComfyUI 必带 torch，正常安装无需操心）。
+#   · safetensors 只在落盘/读回时**函数内延迟 import**（relay_core.save_av_latent /
+#     load_av_latent）——缺少它时节点仍能注册，用到落盘那一步才报错。
 
 safetensors>=0.4
 torch>=2.0

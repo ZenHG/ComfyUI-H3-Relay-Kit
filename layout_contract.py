@@ -127,8 +127,9 @@ def check_layout(force: bool = False) -> Tuple[bool, List[str]]:
 
     if upstream is None:
         msgs.append("契约检查未能确认上游网格（不影响本次运行，但请留意接缝表现）。")
-        _CACHE = (ok, msgs)
-        return _CACHE
+        # ★ 不写缓存：「找不到上游」可能只是导入时序/路径问题。若把这次放行
+        #   永久缓存，之后上游真的改了网格也再不会复查——下次执行会重试解析。
+        return ok, msgs
 
     ours = tuple(CORE.FRAME_PER_TOKEN)
     if upstream == ours:

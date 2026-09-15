@@ -12,7 +12,9 @@ python tests/test_relay_core.py
 ```
 - 零 GPU、不加载模型、秒级完成。会自动上溯定位 ComfyUI 根目录；装在别处时用
   `COMFYUI_PATH=/path/to/ComfyUI python tests/test_relay_core.py` 指定。
-- 覆盖十二个方面（**实测执行 103 项断言**），是本包正确性的主要保障。
+  注意：脚本本身需要**能 import 到 ComfyUI**（`comfy.nested_tensor` / `node_helpers` /
+  `folder_paths`）——`relay_core` 模块可独立复用，但这份打包测试**不能**脱离 ComfyUI 跑。
+- 覆盖十六个方面（**实测执行 154 项断言**），是本包正确性的主要保障。
   报告里请贴实际执行数，不要按源码行数统计（互斥分支不会同时执行）。
 
 ## 代码纪律

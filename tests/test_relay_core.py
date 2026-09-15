@@ -10,6 +10,7 @@
     COMFYUI_PATH=/path/to/ComfyUI python tests/test_relay_core.py
 
 只需要 ``torch`` 与 ``safetensors``；不加载任何模型、不碰显存。
+但需要能 import 到 ComfyUI（comfy.nested_tensor / node_helpers / folder_paths）。
 
 覆盖：
   1. 时序网格自洽（22 帧=7 步 / 39 帧=12 步 / 192 帧=57 步）
@@ -24,6 +25,10 @@
  10. streams_from_latent 对非 NestedTensor 的健壮性（不得按 batch 维误拆）
  11. H3RelayChain 的 status 槽位与前端一致
  12. 沉降帧 settle：pin 与 crop 解耦 + 自动检测（观测端决定，用户零配置）
+ 13. 沉降三路检测：硬跳验身 / 锐度塌陷-恢复 / 双基准与量纲不变
+ 14. 拷贝桥（0.4.0）：位级拷贝 + 噪声掩码 + raise 防线
+ 15. 色档收敛信号（0.4.1）：注噪/taper 收敛尾巴的观测端
+ 16. 0.4.2 回归：导出音频分支 / 中文 note / 服务端校验 / 掩码设备 / 契约降级缓存
 """
 
 import os
@@ -115,13 +120,15 @@ check("每块与源 latent 尾段逐位相同", same)
 check("尾段最后一块 == 源 latent 最后一 token",
       torch.equal(blocks[-1], pv[:1, :, -1:]))
 
-tail_a, rt, overhang, raw_steps = CORE.audio_tail_from_latent(prev, 22, 22)
+# 注意第 3 参是**源段总帧数**（外溢偏差对着总帧数量才有意义，见函数 docstring）
+tail_a, rt, overhang, raw_steps, grid_off = CORE.audio_tail_from_latent(prev, 22, 192)
 check("音频尾段步数 == ceil(22/24*40) = 37（拓宽到整步）", rt == 37, "得到 %d" % rt)
 check("raw_steps 报告理论步数 36.67", abs(raw_steps - 22 / 24.0 * 40) < 1e-6,
       "得到 %.4f" % raw_steps)
 check("音频尾段与源尾段逐位相同", torch.equal(tail_a, pa[:1, ..., int(pa.shape[-1]) - rt:]))
 check("音频栅格外溢在容差内", abs(overhang) < 0.5, "overhang=%.3f" % overhang)
-_, rt7, _, raw7 = CORE.audio_tail_from_latent(prev, 7, 22)
+check("标准网格段 grid_off=False", grid_off is False)
+_, rt7, _, raw7, _ = CORE.audio_tail_from_latent(prev, 7, 192)
 check("off-grid 音频窗 7 帧 → 拓宽到 12 整步（11.67 向上）", rt7 == 12, "得到 %d" % rt7)
 check("off-grid 报告理论步数 11.67", abs(raw7 - 7 / 24.0 * 40) < 1e-6, "得到 %.4f" % raw7)
 
@@ -727,6 +734,19 @@ check("14.14 节点注册 + required 键序 + optional 末位（追加铁律）"
       and list(_it["optional"])[-1] == "pin_audio",
       "required=%s optional=%s" % (list(_it["required"]), list(_it["optional"])))
 
+# —— 14.15/14.16 掩码语义钉子（2026-09-15）——
+# 动机：taper 曾被下游误当「软一点的硬锁」当默认跑了 23 次，段首被重画导致「续不上」。
+# 这里把语义本身断言下来：hard 全 0 = 真钉住；taper 每一帧 m>0 = **没有被钉住**。
+# 谁要改 taper 的方向，先过这两条，再回头改 nodes/README/CHANGES 的措辞。
+check("14.15 hard 掩码 = 钉住区全 0（真钉住：d*0 + anchor*1）",
+      bool((outC["noise_mask"][:, :, :7] == 0).all()),
+      "min=%s max=%s" % (float(m[:, :, :7].min()), float(m[:, :, :7].max())))
+check("14.16 taper 掩码 = 钉住区**无一处为 0**（头 1.0 全重绘，缝端仍留 seam_min）",
+      bool((mT[:, :, :7] > 0).all()) and float(mT[:, :, 0, 0, 0]) == 1.0
+      and float(mT[:, :, 6, 0, 0]) > 0.0,
+      "头=%.2f 缝端=%.2f 最小=%.4f（taper 不钉住）"
+      % (float(mT[:, :, 0, 0, 0]), float(mT[:, :, 6, 0, 0]), float(mT[:, :, :7].min())))
+
 # ============ 组15：色档收敛信号（v0.4.1）——注噪/taper 收敛尾巴的观测端 ============
 
 def grade_seg(n=40, pin=22, dark=(22, 25), factor=0.88, seed=13):
@@ -765,6 +785,111 @@ check("15.3 三信号取最大：mild 模糊(4) 与压暗色档(≥4) → settle
 check("15.4 量纲不变：0-1 输入同结论",
       CORE.detect_settle(grade_seg() / 255.0, 22)[0] == 3,
       "settle=%d" % CORE.detect_settle(grade_seg() / 255.0, 22)[0])
+
+# ============ 组16：0.4.2 回归（导出音频分支 / 中文 note / 服务端校验） ============
+
+# 16.1 导出音频尾段分支（0.4.1 前返回 3 元组 → 解包必崩，此前从未被测）
+exp_prev = dict(prev)
+_pa2 = CORE.audio_from_latent(prev)     # 别用组 2 的 pa——组 14 已把同名变量覆盖成小 latent
+exp_tail_v, _eo, _ec = CORE.video_tail_from_latent(prev, 22)
+exp_prev[CORE.KEY_EXPORT_TAIL_VIDEO] = torch.cat(exp_tail_v, dim=2)
+exp_prev[CORE.KEY_EXPORT_FRAMES] = 22
+exp_prev[CORE.KEY_EXPORT_TAIL_AUDIO] = _pa2[0, :, :, -37:]   # 3 维，顺带测 unsqueeze
+try:
+    t_x, rt_x, oh_x, raw_x, go_x = CORE.audio_tail_from_latent(exp_prev, 22, 192)
+    check("16.1 导出音频分支返回 5 元组且步数=尾段长", rt_x == 37 and go_x is False,
+          "rt=%d" % rt_x)
+except (ValueError, TypeError) as e:
+    check("16.1 导出音频分支返回 5 元组且步数=尾段长", False, "→ %s" % e)
+plan_x = CORE.plan_relay(cur, exp_prev, 22)
+check("16.2 plan_relay 走导出尾段快路径不崩且续接成功",
+      plan_x.applied and plan_x.audio_ref["ref_audio_t"] == 37)
+cb_t, cb_trim, cb_rep = CORE.build_continue_latent(cur, exp_prev, 22)
+check("16.3 拷贝桥走导出音频分支不崩（trim=22）", cb_trim == 22)
+
+# 16.4 中文 note 落盘往返（0.4.1 前 ord(c)>255 直接崩）
+tmp_c = os.path.join(tempfile.gettempdir(), "relay_kit_test", "stage_cjk.safetensors")
+try:
+    CORE.save_av_latent(prev, tmp_c, note="22帧窗 v2 备注——中文、emoji🎬")
+    back_c = CORE.load_av_latent(tmp_c)
+    # 比较基准现取：组 14 已把组 2 的局部名 pv/pa 覆盖成拷贝桥的小 latent
+    check("16.4 中文 note 落盘往返不崩且流仍逐位相同",
+          torch.equal(CORE.streams_from_latent(back_c)[0],
+                      CORE.video_from_latent(prev)))
+except Exception as e:
+    check("16.4 中文 note 落盘往返不崩且流仍逐位相同", False, "→ %s: %s" % (type(e).__name__, e))
+check("16.5 原子写：落盘后无 .tmp 残留", not os.path.isfile(tmp_c + ".tmp"))
+
+# 16.6 stage_index=0 的友好报错可达（0.4.1 前被 _stage_path 抢抛「不能为负」）
+expect_raise("16.6 LatentLoad stage_index=0 → 引导文案（而非「不能为负」）",
+             lambda: NODES.H3RelayLatentLoad().load(run_id="unittest_arity", stage_index=0),
+             "没有上一段可续")
+
+# 16.7 run_id 非法字符替换为 _（不再静默同目录）
+p_a = NODES._stage_path("my/film", 0)
+p_b = NODES._stage_path("myfilm", 0)
+check("16.7 run_id 含斜杠 → 替换为 _，与纯字母名不撞目录",
+      p_a != p_b and "my_film" in p_a)
+_nul_dir = os.path.basename(os.path.dirname(NODES._stage_path("NUL", 0)))
+check("16.8 run_id Windows 保留名加后缀避让", _nul_dir == "NUL_", "目录名=%s" % _nul_dir)
+expect_raise("16.9 run_id 全非法字符仍视为空 → raise",
+             lambda: NODES._stage_path("///", 0), "不能为空")
+
+# 16.10 fps 服务端校验（widget min=1 只挡 UI，API 可提交 0/NaN）
+expect_raise("16.10 fps=0 → raise（不再 ZeroDivisionError）",
+             lambda: NODES.H3RelayTrimAV().trim(images=img73, trim_frames=22, fps=0.0),
+             "fps 必须")
+expect_raise("16.11 fps=NaN → raise",
+             lambda: NODES.H3RelayTrimAV().trim(images=img73, trim_frames=22, fps=float("nan")),
+             "fps 必须")
+
+# 16.12 音频栅格偏差告警可达（0.4.1 前 overhang 被覆写 0.0，if overhang: 永不触发）
+off_grid = {"samples": NT.NestedTensor([
+    CORE.video_from_latent(prev)[0],
+    torch.zeros(1, 32, 2, 200),   # 音频 tick 远偏离 round(5/3*192)=320 → grid_off
+])}
+plan_g = CORE.plan_relay(cur, off_grid, 22)
+check("16.12 非标准音频栅格 → notes 出现偏差告警",
+      any("偏差超出半整步" in n for n in plan_g.notes),
+      "notes=%s" % plan_g.notes)
+
+# 16.13 pin_audio=False 走纯视频 latent（0.4.1 前无条件要求音频流）
+pure_t = {"samples": torch.rand(1, 4, 12, 8, 8)}
+pure_p = {"samples": torch.rand(1, 4, 12, 8, 8)}
+try:
+    out_p, trim_p, rep_p = CORE.build_continue_latent(pure_t, pure_p, 22, pin_audio=False)
+    check("16.13 纯视频 latent + pin_audio=False 走通（trim=22）", trim_p == 22, rep_p)
+except ValueError as e:
+    check("16.13 纯视频 latent + pin_audio=False 走通（trim=22）", False, "→ %s" % e)
+expect_raise("16.14 纯视频 latent + pin_audio=True → 明确 raise（需要音频流）",
+             lambda: CORE.build_continue_latent(pure_t, pure_p, 22, pin_audio=True),
+             "音频流")
+
+# 16.15 契约降级不缓存：找不到上游时的放行不能被永久缓存
+LC = NODES.CONTRACT        # layout_contract 是包内相对导入，走 nodes 已加载的模块对象
+_saved = LC._CACHE
+LC._CACHE = None
+_orig_ext = LC._extract_frame_per_token
+LC._extract_frame_per_token = lambda: (None, ["模拟：上游不可见"])
+r1 = LC.check_layout()
+calls = [0]
+def _counting():
+    calls[0] += 1
+    return (None, ["模拟：上游不可见"])
+LC._extract_frame_per_token = _counting
+r2 = LC.check_layout()
+LC._extract_frame_per_token = _orig_ext
+LC._CACHE = _saved
+check("16.15 降级放行不写缓存（下次执行会重试解析）",
+      r1[0] and r2[0] and calls[0] == 1 and LC._CACHE is _saved)
+
+# 16.16 拷贝桥掩码与 latent 同设备同 batch
+mask_p = out_p["noise_mask"]
+check("16.16 noise_mask 与 latent 同设备", mask_p.device == pure_t["samples"].device)
+b_multi = {"samples": torch.rand(2, 4, 12, 8, 8)}
+b_prev = {"samples": torch.rand(1, 4, 12, 8, 8)}
+out_b, _, _ = CORE.build_continue_latent(b_multi, b_prev, 22, pin_audio=False)
+check("16.17 batch=2 时掩码 batch 维随 target", int(out_b["noise_mask"].shape[0]) == 2)
 
 print()
 print("=" * 78)

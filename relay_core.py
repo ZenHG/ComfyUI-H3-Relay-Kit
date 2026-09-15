@@ -233,13 +233,18 @@ def video_tail_from_latent(
 
 
 def audio_tail_from_latent(
-    latent: Any, a_frames: int, video_frames: int
-) -> Tuple[torch.Tensor, int, float, float]:
+    latent: Any, a_frames: int, src_total_frames: int
+) -> Tuple[torch.Tensor, int, float, float, bool]:
     """从 AV latent 切出 ``a_frames`` 帧对应的**音频尾段**。
 
-    返回 ``(tail, ref_audio_t, overhang, raw_steps)``。
+    ``src_total_frames`` 是**源段（latent）的总像素帧数**——H3 的音频 tick 数按
+    总帧数四舍五入生成，外溢偏差只有对着总帧数量才有意义（对着尾窗量恒为巨值）。
+
+    返回 ``(tail, ref_audio_t, overhang, raw_steps, grid_off)``。
     非 40Hz 网格整步的 ``a_frames`` 会向上拓宽到最近整步（``ref_audio_t``），
     ``raw_steps`` 是换算的理论步数，供上层留注记。
+    ``grid_off`` 为 True 表示音频栅格偏差超出半整步（输入段可能非标准网格），
+    此时 ``overhang`` 按 0 处理，告警文案由上层写进 notes。
     """
     a_frames = int(a_frames)
 
@@ -249,14 +254,16 @@ def audio_tail_from_latent(
             exported = exported.unsqueeze(0)
         if exported.ndim != 4:
             raise ValueError("latent 内附的导出音频尾段形状非法。")
-        return exported[:1].clone(), int(exported.shape[-1]), 0.0
+        n_t = int(exported.shape[-1])
+        return exported[:1].clone(), n_t, 0.0, float(n_t), False
 
     audio = audio_from_latent(latent)
     total_t = int(audio.shape[-1])
-    overhang = total_t - FRAME_RESCALE * int(video_frames)
-    if not (-0.5 < overhang < 0.5):
+    overhang = total_t - FRAME_RESCALE * int(src_total_frames)
+    grid_off = not (-0.5 < overhang < 0.5)
+    if grid_off:
         # H3 把音频栅格四舍五入到最近的步；偏差过大只可能是输入不对，
-        # 这里按无外溢处理并留痕，交给上层决定是否告警。
+        # 这里按无外溢处理，由 grid_off 标志让上层决定是否告警。
         overhang = 0.0
 
     raw_steps = a_frames / float(FPS) * AUDIO_HZ
@@ -269,7 +276,7 @@ def audio_tail_from_latent(
     if rt < 1:
         raise ValueError("音频窗口为空（%d 帧换算后不足一步）。" % a_frames)
     tail = audio[:1, ..., total_t - rt:].clone()
-    return tail, rt, float(overhang), raw_steps
+    return tail, rt, float(overhang), raw_steps, grid_off
 
 
 # ---------------------------------------------------------------- 续接计划
@@ -393,7 +400,15 @@ def plan_relay(
     ]
 
     a_frames = int(audio_frames) if audio_frames else trim_frames
-    tail, rt, overhang, raw_steps = audio_tail_from_latent(context_latent, a_frames, covered)
+    src_total_frames = pixel_frames(int(src.shape[2]))
+    tail, rt, overhang, raw_steps, grid_off = audio_tail_from_latent(
+        context_latent, a_frames, src_total_frames)
+    if grid_off:
+        plan.notes.append(
+            "⚠ 音频栅格与视频帧数偏差超出半整步（上段 %d 帧，音频栅格换算后与之对不上），"
+            "已按无外溢处理——输入段可能不是标准 H3 网格，请检查上一段来源。"
+            % src_total_frames
+        )
     if rt > raw_steps + 1e-6:
         plan.notes.append(
             "音频窗 %d 帧换算 %.2f 步，已拓宽到 %d 整步（宁多带、不截短）。"
@@ -474,18 +489,34 @@ def save_av_latent(latent: Any, path: str, note: str = "") -> str:
     for i, t in enumerate(parts):
         name = "video" if i == 0 else ("audio" if i == 1 else "stream_%d" % i)
         names.append(name)
-        # safetensors 要求连续内存且无共享存储
-        tensors["streams." + name] = t.detach().to("cpu").contiguous().clone()
+        # safetensors 要求连续内存。detach() 已脱离 autograd 共享（与旧版 clone 的
+        # 安全性等价），跨设备时 .cpu() 本来就物化新张量——不再额外 clone，
+        # 落盘瞬间的 CPU 峰值从 2-3 倍降到 1 倍。
+        tc = t.detach()
+        if tc.device.type != "cpu":
+            tc = tc.cpu()
+        tensors["streams." + name] = tc.contiguous()
     meta = {
         "format": 1,
         "streams": names,
         "shapes": [list(t.shape) for t in parts],
         "note": str(note),
     }
-    tensors[_LATENT_META_KEY] = torch.tensor(
-        [ord(c) for c in json.dumps(meta, ensure_ascii=False)], dtype=torch.uint8
-    )
-    save_file(tensors, path)
+    # UTF-8 字节流：note 含中文时 ord(c) 会超 uint8 直接崩，必须先 encode
+    meta_bytes = json.dumps(meta, ensure_ascii=False).encode("utf-8")
+    tensors[_LATENT_META_KEY] = torch.frombuffer(bytearray(meta_bytes), dtype=torch.uint8)
+    # 原子写：先写同目录 .tmp 再替换，中途崩溃不会留下截断的 safetensors
+    tmp = path + ".tmp"
+    try:
+        save_file(tensors, tmp)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
     return path
 
 
@@ -589,7 +620,7 @@ GRADE_DEV_FLOOR: float = 0.003  # 绝对下限（0-1 量纲；255 量纲测试�
 #     的正常渐变误裁，只有比值会在分布漂移时定位失准；
 #   · 硬跳必须**验身**：跳后 2-5 帧锐度回到体分布才采信，否则视为假跳/闪烁交给锐度路。
 Z_JUMP: float = 8.0                # 硬跳的稳健 z 门槛（对段体帧差 MAD 标准化；实测真跳 z≈90）
-_LAP_KERNEL = None                 # 惰性初始化的 3×3 Laplacian 卷积核
+_LAP_KERNELS: dict = {}            # 按 device 字符串惰性缓存的 3×3 Laplacian 卷积核
 
 
 def _robust_stats(x: torch.Tensor) -> Tuple[float, float]:
@@ -601,10 +632,15 @@ def _robust_stats(x: torch.Tensor) -> Tuple[float, float]:
     return med, mad
 
 
+def _abs_max(t: torch.Tensor) -> float:
+    """max(|t|)，不物化 abs() 的全量拷贝（float 张量上 max(|min|, max) 与之等价）。"""
+    return max(-float(t.min()), float(t.max()))
+
+
 def _baseline_floor(images: torch.Tensor) -> float:
     """帧差基线的保护下限，随数据实际量纲缩放（0-1 产线 / 0-255 测试同一套阈值）。"""
     try:
-        scale = float(images.detach().abs().max())
+        scale = _abs_max(images.detach())
     except Exception:
         return 0.0
     return BASELINE_FLOOR_REL * scale if scale > 0 else 0.0
@@ -616,19 +652,22 @@ def _sharpness(images: torch.Tensor) -> torch.Tensor:
     带纹理的画面显著大于 0；重绘发虚（模糊）先杀高对比边缘，平方度量把它放大
     （实测：HD mild 塌陷帧在方差度量下 0.29-0.45×基准，mean-abs 度量下只见 0.79-0.83×）。
     """
-    global _LAP_KERNEL
     f = images.to(torch.float32)
     if f.dim() != 4:
         return torch.zeros(0)
     g = f.mean(dim=-1).unsqueeze(1)                    # [N,1,H,W]
-    if _LAP_KERNEL is None or _LAP_KERNEL.device != g.device:
-        _LAP_KERNEL = g.new_tensor([[0.0, 1.0, 0.0],
-                                    [1.0, -4.0, 1.0],
-                                    [0.0, 1.0, 0.0]]).view(1, 1, 3, 3)
+    # 按 device 分键缓存：多 GPU / 多设备交替时不会来回重建，也无全局竞态
+    key = str(g.device)
+    kern = _LAP_KERNELS.get(key)
+    if kern is None or kern.device != g.device:
+        kern = g.new_tensor([[0.0, 1.0, 0.0],
+                             [1.0, -4.0, 1.0],
+                             [0.0, 1.0, 0.0]]).view(1, 1, 3, 3)
+        _LAP_KERNELS[key] = kern
     # replicate pad（不能用 conv2d 自带的 zero pad：常数帧边界会吃出假响应，
     # 小分辨率合成测试里边界占比过半，整个度量直接反转）
     gp = torch.nn.functional.pad(g, (1, 1, 1, 1), mode="replicate")
-    resp = torch.nn.functional.conv2d(gp, _LAP_KERNEL)
+    resp = torch.nn.functional.conv2d(gp, kern)
     return resp.pow(2).mean(dim=(1, 2, 3))             # [N]
 
 
@@ -649,10 +688,11 @@ def scan_head_jump(images: torch.Tensor, scan: int = 40) -> Tuple[int, float, fl
     n = int(images.shape[0])
     if n < 4:
         return -1, 0.0, 0.0
-    diff = _frame_diffs(images)
+    # ★ 先切窗再做差：整段物化两遍全量帧差，在 120+ 帧 / 768×448 上是 ~1GB 的瞬时峰值
     hi = min(scan, n - 1)
     if hi <= 2:
         return -1, 0.0, 0.0
+    diff = _frame_diffs(images[:hi + 1])
     baseline = float(diff[2:hi].median())
     seg = diff[:hi]
     j = int(torch.argmax(seg).item())
@@ -782,7 +822,9 @@ def detect_settle(
         devs_head = (rgb_head[pin: pin + max_settle + 1] - ref_rgb).abs().mean(-1)
         devs_body = (rgb_body - ref_rgb).abs().mean(-1)
         _, b_mad_g = _robust_stats(devs_body)
-        thr = max(GRADE_DEV_Z * b_mad_g, GRADE_DEV_FLOOR * float(images.abs().max() or 1.0))
+        # 量纲下限用已切出的小窗 + 体区估计，不对整段物化 abs()
+        scale = max(_abs_max(win), _abs_max(body)) or 1.0
+        thr = max(GRADE_DEV_Z * b_mad_g, GRADE_DEV_FLOOR * scale)
         ok = devs_head <= thr
         if bool(ok.any()):
             c = int(ok.nonzero()[0].item())            # 首个回归基准的帧（窗内偏移）
@@ -861,7 +903,15 @@ def prefix_taper_weights(
     taper: int = SEAM_TAPER_TOKENS,
     seam_min: float = SEAM_MIN_MASK,
 ) -> Tuple[float, ...]:
-    """拷贝前缀的掩码权重：头部 1.0（自由重绘，反正被裁），线性降到缝端 seam_min（近硬锁）。"""
+    """拷贝前缀的掩码权重：头部 1.0（**完全重绘**，反正被裁），线性降到缝端 seam_min。
+
+    ⚠️ **这不是「软一点的硬锁」——taper 档下钉住区没有被钉住。**
+    掩码语义是 ``denoised = 模型生成 * m + 上段尾 * (1-m)``：m=0 才钉住，m=1 是重绘。
+    所以 taper 档每一帧都留 ``seam_min``~100% 的重绘自由度（seam_min=0.3 即缝端仍 30% 重绘），
+    段首会被模型改写 ⇒ 观感「续不上」，而 TrimAV 仍按窗口帧数照裁 ⇒ 顺带裁掉真实剧情。
+    本档**只用于「渐进接管」对照实验**；真续接请用 ``mask_mode="hard"``。
+    （2026-09-15：产线曾误把 taper 当默认跑了 23 次，见 CHANGES 0.4.2 文档节。）
+    """
     n = int(steps)
     if n < 1:
         return ()
@@ -930,34 +980,52 @@ def build_continue_latent(
             % (steps, total_t)
         )
 
+    # tv.clone() 是必须的：下面要原位写前缀，不能污染调用方的 latent。
+    # 峰值 ≈ 1×target 视频流（latent 在 GPU 时即 1× 显存，尾段 blocks 本身已占 steps/total）。
     video = tv.clone()
     tail_v = torch.cat(blocks, dim=2).to(device=video.device, dtype=video.dtype)
     video[:, :, :steps] = tail_v
 
-    audio = audio_from_latent(target).clone()
+    audio = None
     rt = 0
     if pin_audio:
-        a_tail, rt, _overhang, _raw = audio_tail_from_latent(prev, int(frames), covered)
+        # 只有真的要钉音频时才要求 target 带音频流——pin_audio=False
+        # 必须允许纯视频 latent 走通（参数语义）。
+        audio = audio_from_latent(target).clone()
+        a_tail, rt, _overhang, _raw, _grid_off = audio_tail_from_latent(
+            prev, int(frames), pixel_frames(int(pv.shape[2])))
         rt = max(0, min(int(rt), int(audio.shape[-1]) - 1))
         if rt > 0:
             audio[..., :rt] = a_tail[..., :rt].to(device=audio.device, dtype=audio.dtype)
+    else:
+        try:
+            audio = audio_from_latent(target)     # 有则原样保留（不拷贝、不改动）
+        except ValueError:
+            audio = None                          # 纯视频桥：只出视频流
 
-    vmask = torch.ones((1, 1, total_t, int(tv.shape[3]), int(tv.shape[4])),
-                       dtype=torch.float32)
+    # 掩码与 latent 同设备同 batch：GPU latent + CPU 掩码会在采样器里炸或静默错位
+    vmask = torch.ones((int(tv.shape[0]), 1, total_t, int(tv.shape[3]), int(tv.shape[4])),
+                       dtype=torch.float32, device=tv.device)
     if mask_mode == "hard":
         vmask[:, :, :steps] = 0.0
         mask_desc = "硬锁（全 0，钉住区零重绘）"
     else:
         w = prefix_taper_weights(steps, taper, seam_min)
-        vmask[:, :, :steps] = torch.tensor(w, dtype=torch.float32).view(1, 1, steps, 1, 1)
+        # 权重直接建在掩码设备上，省一次跨设备拷贝（latent 在 GPU 时 vmask 也在 GPU）
+        vmask[:, :, :steps] = torch.tensor(w, dtype=torch.float32,
+                                           device=vmask.device).view(1, 1, steps, 1, 1)
         mask_desc = "锥形 %.2f→%.2f（taper=%d）" % (w[0], w[-1], taper)
 
     out = dict(target) if isinstance(target, dict) else {}
-    out["samples"] = _nested_pair(video, audio, tv)
+    if audio is None:
+        out["samples"] = video          # 纯视频路径：不打包 NestedTensor
+    else:
+        out["samples"] = _nested_pair(video, audio, tv)
     out["noise_mask"] = vmask
     report = (
-        "[H3 Relay] 拷贝桥：写入 %d 步（%d 帧）视频尾 + %d 音频 tick（上下文用）；"
+        "[H3 Relay] 拷贝桥：写入 %d 步（%d 帧）视频尾 + %d 音频 tick（上下文用%s）；"
         "掩码 %s；trim=%d"
-        % (steps, covered, rt, mask_desc, covered)
+        % (steps, covered, rt,
+           "" if audio is not None else "／本段无音频流", mask_desc, covered)
     )
     return out, int(covered), report

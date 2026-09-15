@@ -26,9 +26,8 @@
 
 from __future__ import annotations
 
+import math
 import os
-import time
-from typing import Any, Dict, Optional, Tuple
 
 import folder_paths
 
@@ -41,12 +40,22 @@ CATEGORY = "H3 Relay Kit"
 # 落盘根目录：ComfyUI/output/relay_kit/
 _RELAY_ROOT = os.path.join(folder_paths.get_output_directory(), "relay_kit")
 
+# Windows 保留设备名：作为目录名会让 makedirs 抛裸 OSError
+_WIN_RESERVED = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {"COM%d" % i for i in range(1, 10)}
+    | {"LPT%d" % i for i in range(1, 10)}
+)
+
 
 def _stage_path(run_id: str, stage_index: int) -> str:
-    """按 run 标识 + 段号推导落盘路径。段号从 1 开始。"""
-    rid = "".join(ch for ch in str(run_id) if ch.isalnum() or ch in "-_")
-    if not rid:
+    """按 run 标识 + 段号推导落盘路径。段号从 0 开始。"""
+    # 非法字符替换为 _（而不是删除）—— 否则 "my/film" 与 "myfilm" 会静默撞进同一目录
+    rid = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in str(run_id))
+    if not rid.strip("_"):
         raise RuntimeError("run_id 不能为空（用来把同一部片子的各段归到一个目录）。")
+    if rid.upper() in _WIN_RESERVED:
+        rid += "_"
     idx = int(stage_index)
     if idx < 0:
         raise RuntimeError("stage_index 不能为负（段号从 0 开始，第 1 段=0）。")
@@ -138,12 +147,15 @@ class H3RelayLatentLoad:
 
     def load(self, run_id, stage_index, explicit_path=""):
         idx = int(stage_index) - 1
-        path = (explicit_path or "").strip() or _stage_path(run_id, idx)
-        if idx < 0 and not (explicit_path or "").strip():
+        explicit = (explicit_path or "").strip()
+        # 必须先判段号再进 _stage_path：否则 stage_index=0 会先撞上
+        # 「stage_index 不能为负」的误导性报错，下面的引导文案永远到不了。
+        if idx < 0 and not explicit:
             raise RuntimeError(
                 "stage_index=0 是第 1 段，没有上一段可续。\n"
                 "    第 1 段请走独立路径（不接本节点，或把续接 Latent 桥的 context_latent 留空）。"
             )
+        path = explicit or _stage_path(run_id, idx)
         latent = CORE.load_av_latent(path)
         info = CORE.describe_latent(latent)
         print("[H3 Relay] 已读 stage %d ← %s\n            %s" % (idx, path, info))
@@ -342,6 +354,17 @@ class H3RelayTrimAV:
 
     def trim(self, images, trim_frames=0, fps=24.0, audio=None, settle_frames=-1):
         CONTRACT.enforce()   # 裁帧算术同样依赖上游网格，先过契约
+        # 服务端防线：widget 的 min=1.0 只挡 UI，API 提交 fps=0/NaN 会一路除到底
+        try:
+            fps = float(fps)
+        except (TypeError, ValueError):
+            fps = float("nan")
+        if not math.isfinite(fps) or fps <= 0:
+            raise RuntimeError(
+                "fps 必须是 (0, +∞) 内的有限正数，得到 %r。\n"
+                "    H3 固定 24 帧/秒——把「裁重叠」的 fps 改回 24 即可（音频按它换算着一起裁）。"
+                % (fps,)
+            )
         pin = int(trim_frames)
         before = int(images.shape[0])
         if pin <= 0:
@@ -442,9 +465,10 @@ class H3RelayCopyBridge:
     与 H3RelayMotionContext（conditioning 钉帧）二选一，不可同图串联：
       · Latent 桥（钉帧）：模型重绘上一段尾段 → 有复现漂移/发糊风险（0.3.x 实测），
         观测端沉降检测兜底；
-      · 拷贝桥（本节点）：钉住区不重绘（掩码 0 区每步被钉回拷贝 latent），复现伪影
-        这一类从机制上消失；掩码消费走 ComfyUI 原生 H3 契约与 SelfLift 的
-        noise_mask 支持——**不绑定任何特定采样器**。
+      · 拷贝桥（本节点）：``mask_mode="hard"`` 时钉住区不重绘（掩码 0 区每步被钉回
+        拷贝 latent），复现伪影这一类从机制上消失；掩码消费走 ComfyUI 原生 H3 契约与
+        SelfLift 的 noise_mask 支持——**不绑定任何特定采样器**。
+        ⚠️ ``mask_mode="taper"`` **不钉住**（每帧留 seam_min~100% 重绘自由度），只作对照实验档。
     输出 INT = 应裁帧数（=拷贝跨度），接 H3RelayTrimAV 的 trim_frames；
     TrimAV 的 settle_frames 保持 -1，观测端继续守接管帧。
     """
@@ -470,8 +494,12 @@ class H3RelayCopyBridge:
             "optional": {
                 "mask_mode": (["hard", "taper"], {
                     "default": "hard",
-                    "tooltip": "hard = 前缀全 0 硬锁（钉住区零重绘，默认，与「复现=漂移源」实测同向）；\n"
-                               "taper = 头部 1.0 线性降到缝端 seam_min（渐进接管实验档）。",
+                    "tooltip": "掩码语义：denoised = 模型生成 * m + 上段尾 * (1-m)。**m=0 才钉住，m=1 是重绘。**\n"
+                               "hard = 全窗 m=0（钉住区零重绘，默认，真续接用这个）；\n"
+                               "taper = 头部 m=1.0（**完全重绘**）线性降到缝端 seam_min\n"
+                               "        —— ⚠ **钉住区实际上没有被钉住**，只是给模型一个软提示；\n"
+                               "        seam_min=0.3 意味着连缝端都留 30% 重绘。\n"
+                               "        仅用于「渐进接管」对照实验；期望真续接请保持 hard。",
                 }),
                 "taper_tokens": ("INT", {
                     "default": 4, "min": 1, "max": 12, "step": 1,
@@ -479,7 +507,9 @@ class H3RelayCopyBridge:
                 }),
                 "seam_min": ("FLOAT", {
                     "default": 0.10, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "仅 taper 模式：缝端掩码下限（0=完全硬锁）。",
+                    "tooltip": "仅 taper 模式：缝端掩码下限（m 值）。\n"
+                               "0 = 缝端完全硬锁；>0 表示缝端仍留同等比例的重绘自由度\n"
+                               "（0.3 即缝端 30% 重绘）。注意它只管缝端——头部恒为 1.0 全重绘。",
                 }),
                 "pin_audio": ("BOOLEAN", {
                     "default": True,

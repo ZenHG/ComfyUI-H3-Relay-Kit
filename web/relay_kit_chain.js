@@ -92,10 +92,14 @@ app.registerExtension({
         nodeType.prototype.onNodeCreated = function () {
             const r = origOnNodeCreated?.apply(this, arguments);
             const node = this;
-            const state = { mode: "idle", remaining: 0 };
+            // sawMine：本轮执行里是否真的跑过本组桥/落盘。executing(null) 是全局事件，
+            // 多个 Chain 组共存时，别的组跑完一轮不能推进本组的段号。
+            const state = { mode: "idle", remaining: 0, sawMine: false };
 
             const stepDone = () => {
                 if (state.mode !== "chain") return;
+                if (!state.sawMine) return; // 本轮没执行过本组的桥/落盘 → 别的组的收尾，忽略
+                state.sawMine = false;
                 const pair = findPair(node);
                 if (!pair) {
                     state.mode = "idle";
@@ -119,7 +123,15 @@ app.registerExtension({
             };
 
             api.addEventListener("executing", ({ detail }) => {
-                if (detail === null) stepDone();
+                if (detail === null) { stepDone(); return; }
+                // 记录「本组节点确实在这轮执行」：只有跑过本组桥/落盘，收尾才归本组
+                if (detail.node != null && state.mode === "chain") {
+                    const id = Number(detail.node);
+                    const pair = findPair(node);
+                    if (pair && (id === pair.bridge.id || id === pair.save.id)) {
+                        state.sawMine = true;
+                    }
+                }
             });
             api.addEventListener("execution_error", () => {
                 if (state.mode === "chain") {

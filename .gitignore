@@ -37,3 +37,9 @@ secrets.json
 
 # ---- Node 工具链（若将来扩展前端）----
 node_modules/
+
+# ---- ZCode 会话本地计划（不入库）----
+.zcode/
+
+# ---- 本地调研笔记（不入库）----
+RESEARCH_*.md

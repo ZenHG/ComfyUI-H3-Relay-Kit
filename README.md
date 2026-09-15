@@ -45,7 +45,7 @@ H3 分段生成时，"续接"要回答一件事：**新的一段怎么知道上�
 
 ```
 [H3 Relay] latent 桥续接：钉住 22 帧 / 7 步，锚位 0..18，裁首 23 帧（含沉降 1），音频 37 步
-[H3 Relay] 裁首 23 帧 = 钉住 22 + 沉降 1 ｜ 自动检测：窗内最大帧差 203.0 / 段内基线 3.0
+[H3 Relay] 裁首 23 帧 = 钉住 22 + 沉降 1 ｜ 自动检测：切换信号 203.0 / 基准 3.0（帧差突变/锐度塌陷/色档收敛）
 [H3 Relay] 接缝自检：前 40 帧无突变（最大帧差 6.00，段内基线 3.00）→ 起点干净。
 ```
 
@@ -57,7 +57,10 @@ H3 分段生成时，"续接"要回答一件事：**新的一段怎么知道上�
 
 > 示例走的是 **MotionContext 桥**（conditioning 路线，0.2.x 起即此接法）。0.4.0 起
 > 还有**拷贝桥** `H3RelayCopyBridge`：把上一段尾 AV latent 逐位拷贝进本段初始
-> latent + 噪声掩码，钉住区**不重绘**——复现发糊/漂移这一类伪影从机制上消失。
+> latent + 噪声掩码，`mask_mode="hard"`（默认）时钉住区**不重绘**——复现发糊/漂移
+> 这一类伪影从机制上消失。
+> ⚠️ `mask_mode="taper"` **不钉住**（掩码从头部 1.0 线性降到 `seam_min`，每帧留
+> `seam_min`~100% 重绘自由度），是「渐进接管」对照实验档，别当默认用。
 > 接法不同：它的输出接 KSampler 的 `latent_image`（不占 positive），见「节点」表
 > 与 `CHANGES.md` 0.4.0。
 
@@ -129,6 +132,7 @@ H3 VAE 的时序跨度为 `(1,4,4,4,4)`：每 5 个 latent token 覆盖 17 像�
 | 🔗 **H3 续接 Latent 存** | 本段采样后，把 AV latent 落盘到 `output/relay_kit/<run_id>/stage_NNNNN.safetensors` |
 | 🔗 **H3 续接 Latent 读** | 读回上一段（段号 - 1），断点续跑时可指定 `explicit_path` 换源 |
 | 🔗 **H3 续接 Latent 桥** | 上一段尾段钉进本段 conditioning；`context_latent` 不接则直通 |
+| 🔗 **H3 续接 拷贝桥** | 上一段尾 AV latent **逐位拷贝**进本段初始 latent + 噪声掩码；`mask_mode="hard"`（默认）时钉住区不重绘，`taper` 档不钉住（见参数表）；输出接采样器 `latent_image`（0.4.0 起，与 Latent 桥二选一） |
 | 🔗 **H3 续接裁重叠** | **裁掉本段头部的重生成帧 + 自动裁掉紧随其后的「复现帧」（视频音频同裁）** —— 不裁就会在拼接处重播/跳变 |
 | 🔗 **H3 续接连跑 Chain** | 自动连跑控制器：同分组框内自动推进「桥 + 落盘」段号并排队（详见下方「Chain 自动连跑」） |
 
@@ -239,7 +243,7 @@ MiniMaxH3ImageToVideo ─┤                      │
 节点会贴着钉住区开一个窄窗找出切换点，把那几帧「复现帧」一并裁掉。
 
 ```
-[H3 Relay] 裁首 23 帧 = 钉住 22 + 沉降 1 ｜ 自动检测：窗内最大帧差 203.0 / 段内基线 3.0
+[H3 Relay] 裁首 23 帧 = 钉住 22 + 沉降 1 ｜ 自动检测：切换信号 203.0 / 基准 3.0（帧差突变/锐度塌陷/色档收敛）
            画面 73 → 50 帧（3.042s → 2.083s）；音频 97333 → 66666 采样点
 [H3 Relay] 接缝自检：前 40 帧无突变（最大帧差 6.00，段内基线 3.00）→ 起点干净。
 ```
@@ -328,6 +332,18 @@ stage 链（落盘/读回）按段号自续（本段段号 - 1 = 要读的段号
 | `audio_frames` | 0 | 音频钉住窗口（像素帧口径）。0 = 与视频同窗 |
 | `context_latent` | — | 上一段 AV latent。不接 = 直通 |
 
+**续接 拷贝桥**（0.4.0，与 Latent 桥二选一）
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `latent` | — | 本段初始 AV latent（接采样器上游） |
+| `context_latent` | — | 上一段完整 AV latent（第 1 段不接本节点） |
+| `context_frames` | 22 | 拷贝窗口帧数，合法值 5/22/39/56/73/90/107/124，须小于本段帧数 |
+| `mask_mode` | `hard` | **掩码语义 = `模型生成 * m + 上段尾 * (1-m)`，m=0 才钉住、m=1 是重绘。**<br>`hard` = 全窗 m=0（钉住区零重绘，**真续接用这个**）；<br>`taper` = 头部 m=1.0（**完全重绘**）线性降到缝端 `seam_min` —— ⚠ **钉住区实际上没有被钉住**，只作「渐进接管」对照实验档 |
+| `taper_tokens` | 4 | 仅 taper：缝端前多少个 token 参与线性过渡 |
+| `seam_min` | 0.10 | 仅 taper：缝端掩码下限（m 值）。`0` = 缝端完全硬锁；`0.3` = 缝端仍留 30% 重绘。**注意它只管缝端，头部恒为 1.0 全重绘** |
+| `pin_audio` | `true` | 上一段音频尾拷进本段音频开头（采样上下文）。纯视频 latent 关掉它 |
+
 **续接裁重叠**
 
 | 参数 | 默认 | 说明 |
@@ -362,8 +378,14 @@ git clone https://github.com/ZenHG/ComfyUI-H3-Relay-Kit.git
 （`minimal_relay_official.json`，全官方节点 + 本包）和它的生成器脚本 ——
 见 [`examples/README.md`](examples/README.md)。
 
-**依赖**：只用 `torch` 与 `safetensors`（ComfyUI 自带；清单见 `requirements.txt`）。
-二者都是**函数内延迟 import**，所以缺了也不会导致节点注册失败，只在真正用到时提示。
+**依赖**：只用 `torch` 与 `safetensors`（ComfyUI 自带；清单见 `requirements.txt`，
+正常安装无需额外 `pip install`）。其中 **`torch` 是模块顶层 import**——缺少它整包注册失败、
+节点列表里一个都看不到；`safetensors` 是延迟 import，缺了只在落盘那一步报错。
+
+**宿主版本要求**：本包硬依赖**带 MiniMax-H3 支持的 ComfyUI**（需要
+`comfy_extras/nodes_minimax_h3.py` 与消费 `minimax_keyframes`/`minimax_refs` 的
+`comfy/model_base.py`）。装到不含 H3 的旧版 ComfyUI 上，节点能注册但续接静默无效——
+用前先确认 ComfyUI 已更新到支持 MiniMax-H3 的版本。
 
 **不依赖任何第三方 H3 节点包**：所用的 `minimax_keyframes` / `minimax_refs` /
 `resolved_frame_index` 全是 ComfyUI **原生**协议，零 monkey patch。
@@ -377,7 +399,7 @@ python tests/test_relay_core.py
 脚本会自动上溯定位 ComfyUI 根目录；装在别处时用
 `COMFYUI_PATH=/path/to/ComfyUI python tests/test_relay_core.py`。
 
-**134 项断言，零 GPU、不加载模型**，覆盖十五个方面：
+**154 项断言，零 GPU、不加载模型**，覆盖十六个方面：
 
 | 组 | 覆盖 |
 |---|---|
@@ -396,6 +418,7 @@ python tests/test_relay_core.py
 | 13 | 模糊型沉降（0.3.1）：帧差法盲区的高频能量补判 |
 | 14 | 拷贝桥（0.4.0）：位级拷贝/掩码结构/音频尾/跨分辨率/前缀占满/相位失配/节点契约 |
 | 15 | 色档收敛信号（0.4.1）：注噪/taper 收敛尾巴的观测端检出 |
+| 16 | 0.4.2 回归：导出音频分支 / 中文 note / 服务端校验 / 掩码设备 / 契约降级缓存 |
 
 ## 排障
 
@@ -415,6 +438,9 @@ python tests/test_relay_core.py
 | 画面两套续接打架 | 上游像素续接没关 | 清空上游的 cont / 参考视频字段 |
 | 台词起音被裁 / 缝区有"无理由伪音" | 对话排进了续接段头部；或音频瞬态没补 | 按「台词安全时刻公式」后移台词 ≥3.2s；组装层开 room tone 头部补丁（见「接缝处的对话规避与音频处理」一节） |
 | **`stage_index=N 表示本段是第 N+1 段，但没有可续接的上一段`** | 手改段号时只改了桥或只改了落盘；或换了片子没填 `run_id` | 两处 `stage_index` 必须一样大、`run_id` 两边一致；确实是独立段就把段号改回 0 |
+| 节点列表里**一个 `🔗 H3 续接` 都没有** | 环境的 `torch` 缺失/损坏（本包顶层 import torch） | 看 ComfyUI 启动日志里本包的 IMPORT FAILED；修复 Python 环境的 torch |
+| 节点能注册但续接毫无效果、日志出现「未找到上游节点文件」 | 宿主 ComfyUI 过旧，不含 MiniMax-H3 支持 | 更新 ComfyUI 到支持 MiniMax-H3 的版本（含 `comfy_extras/nodes_minimax_h3.py`） |
+| 日志出现 `上游时序网格已变` | ComfyUI 更新后 H3 网格与本版不匹配 | 按提示到本仓库提 Issue；在修复版发布前别用续接 |
 
 > ⚠️ 最后一条是 **0.2.1 起新增的硬拦**。旧版遇到这种情况会**静默按独立段直通**——
 > 界面一路绿灯，产出的却是没有续接的接缝，只有目检才发现。现在直接报错。
